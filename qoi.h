@@ -336,6 +336,28 @@ typedef union {
 	unsigned int v;
 } qoi_rgba_t;
 
+/* Unaligned 32-bit store without strict-aliasing UB. On little-endian
+   targets the packed assignment lowers to a single mov. */
+#if defined(__GNUC__) || defined(__clang__)
+typedef struct { unsigned int v; } __attribute__((packed)) qoi_u32le_t;
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define QOI_STORE_U32LE(p, word) do { \
+	unsigned int qoi_w_ = (word); \
+	qoi_w_ = __builtin_bswap32(qoi_w_); \
+	((qoi_u32le_t *)(void *)(p))->v = qoi_w_; \
+} while (0)
+#else
+#define QOI_STORE_U32LE(p, word) ((qoi_u32le_t *)(void *)(p))->v = (word)
+#endif
+#else
+#define QOI_STORE_U32LE(p, word) do { \
+	(p)[0] = (unsigned char)(word); \
+	(p)[1] = (unsigned char)((word) >> 8); \
+	(p)[2] = (unsigned char)((word) >> 16); \
+	(p)[3] = (unsigned char)((word) >> 24); \
+} while (0)
+#endif
+
 static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
 
 static void qoi_write_32(unsigned char *bytes, int *p, unsigned int v) {
@@ -356,8 +378,8 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
-	const unsigned char *pixels;
+	unsigned char *restrict bytes;
+	const unsigned char *restrict pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
 
@@ -403,39 +425,114 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	px_end = px_len - desc->channels;
 	channels = desc->channels;
 
-	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
-		px.rgba.r = pixels[px_pos + 0];
-		px.rgba.g = pixels[px_pos + 1];
-		px.rgba.b = pixels[px_pos + 2];
+	/* One loop per channel count hoists the channels==4 branch out of the
+	   hot path. Both loops emit the exact same chunk sequence. */
+	if (channels == 4) {
+		for (px_pos = 0; px_pos < px_len; px_pos += 4) {
+			/* One 32-bit load feeds the whole pixel instead of three/four
+			   byte loads and a per-pixel channels branch. */
+			memcpy(&px, pixels + px_pos, 4);
 
-		if (channels == 4) {
-			px.rgba.a = pixels[px_pos + 3];
-		}
-
-		if (px.v == px_prev.v) {
-			run++;
-			if (run == 62 || px_pos == px_end) {
-				bytes[p++] = QOI_OP_RUN | (run - 1);
-				run = 0;
-			}
-		}
-		else {
-			int index_pos;
-
-			if (run > 0) {
-				bytes[p++] = QOI_OP_RUN | (run - 1);
-				run = 0;
-			}
-
-			index_pos = QOI_COLOR_HASH(px) & (64 - 1);
-
-			if (index[index_pos].v == px.v) {
-				bytes[p++] = QOI_OP_INDEX | index_pos;
+			if (px.v == px_prev.v) {
+				run++;
+				if (run == 62 || px_pos == px_end) {
+					bytes[p++] = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
 			}
 			else {
-				index[index_pos] = px;
+				if (run > 0) {
+					bytes[p++] = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
 
-				if (px.rgba.a == px_prev.rgba.a) {
+				int index_pos = QOI_COLOR_HASH(px) & 63;
+
+				if (index[index_pos].v == px.v) {
+					bytes[p++] = QOI_OP_INDEX | index_pos;
+				}
+				else {
+					index[index_pos] = px;
+
+					if (px.rgba.a == px_prev.rgba.a) {
+						signed char vr = px.rgba.r - px_prev.rgba.r;
+						signed char vg = px.rgba.g - px_prev.rgba.g;
+						signed char vb = px.rgba.b - px_prev.rgba.b;
+
+						signed char vg_r = vr - vg;
+						signed char vg_b = vb - vg;
+
+						if (
+							vr > -3 && vr < 2 &&
+							vg > -3 && vg < 2 &&
+							vb > -3 && vb < 2
+						) {
+							bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
+						}
+						else if (
+							vg_r >  -9 && vg_r <  8 &&
+							vg   > -33 && vg   < 32 &&
+							vg_b >  -9 && vg_b <  8
+						) {
+							bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
+							bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+						}
+						else {
+							/* Single unaligned 32-bit store for the 4-byte
+							   RGB chunk. The store may write 3 bytes past
+							   the logical stream end, but the buffer always
+							   reserves the 8-byte end marker and the marker
+							   overwrites them afterwards. Avoiding memcpy()
+							   keeps fortified libc from emitting a per-pixel
+							   function call. */
+							unsigned int rgb_word = QOI_OP_RGB
+								| (unsigned int)px.rgba.r << 8
+								| (unsigned int)px.rgba.g << 16
+								| (unsigned int)px.rgba.b << 24;
+							QOI_STORE_U32LE(bytes + p, rgb_word);
+							p += 4;
+						}
+					}
+					else {
+						bytes[p + 0] = QOI_OP_RGBA;
+						bytes[p + 1] = px.rgba.r;
+						bytes[p + 2] = px.rgba.g;
+						bytes[p + 3] = px.rgba.b;
+						bytes[p + 4] = px.rgba.a;
+						p += 5;
+					}
+				}
+			}
+			px_prev = px;
+		}
+	}
+	else {
+		for (px_pos = 0; px_pos < px_len; px_pos += 3) {
+			px.rgba.r = pixels[px_pos + 0];
+			px.rgba.g = pixels[px_pos + 1];
+			px.rgba.b = pixels[px_pos + 2];
+
+			if (px.v == px_prev.v) {
+				run++;
+				if (run == 62 || px_pos == px_end) {
+					bytes[p++] = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
+			}
+			else {
+				if (run > 0) {
+					bytes[p++] = QOI_OP_RUN | (run - 1);
+					run = 0;
+				}
+
+				int index_pos = QOI_COLOR_HASH(px) & 63;
+
+				if (index[index_pos].v == px.v) {
+					bytes[p++] = QOI_OP_INDEX | index_pos;
+				}
+				else {
+					index[index_pos] = px;
+
 					signed char vr = px.rgba.r - px_prev.rgba.r;
 					signed char vg = px.rgba.g - px_prev.rgba.g;
 					signed char vb = px.rgba.b - px_prev.rgba.b;
@@ -459,22 +556,17 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
 					}
 					else {
-						bytes[p++] = QOI_OP_RGB;
-						bytes[p++] = px.rgba.r;
-						bytes[p++] = px.rgba.g;
-						bytes[p++] = px.rgba.b;
+						unsigned int rgb_word = QOI_OP_RGB
+							| (unsigned int)px.rgba.r << 8
+							| (unsigned int)px.rgba.g << 16
+							| (unsigned int)px.rgba.b << 24;
+						QOI_STORE_U32LE(bytes + p, rgb_word);
+						p += 4;
 					}
 				}
-				else {
-					bytes[p++] = QOI_OP_RGBA;
-					bytes[p++] = px.rgba.r;
-					bytes[p++] = px.rgba.g;
-					bytes[p++] = px.rgba.b;
-					bytes[p++] = px.rgba.a;
-				}
 			}
+			px_prev = px;
 		}
-		px_prev = px;
 	}
 
 	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
