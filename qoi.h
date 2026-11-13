@@ -491,13 +491,15 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px;
-	int px_len, chunks_len, px_pos;
-	int p = 0, run = 0;
+	size_t px_len, px_pos;
+	unsigned long pixel_count, byte_count;
+	int p = 0, run = 0, b2, vg, chunks_len;
 
 	if (
 		data == NULL || desc == NULL ||
 		(channels != 0 && channels != 3 && channels != 4) ||
-		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
+		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding) ||
+		size > 0x7fffffff
 	) {
 		return NULL;
 	}
@@ -515,7 +517,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		desc->channels < 3 || desc->channels > 4 ||
 		desc->colorspace > 1 ||
 		header_magic != QOI_MAGIC ||
-		desc->height >= QOI_PIXELS_MAX / desc->width
+		desc->width > QOI_PIXELS_MAX / desc->height
 	) {
 		return NULL;
 	}
@@ -524,7 +526,20 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		channels = desc->channels;
 	}
 
-	px_len = desc->width * desc->height * channels;
+	/* Compute the allocation in unsigned-long arithmetic so a hostile
+	   header cannot wrap the pixel/byte count into a small allocation.
+	   The pixel-count check above already bounds width*height; guard the
+	   multiplication explicitly as well. */
+	pixel_count = (unsigned long)desc->width * (unsigned long)desc->height;
+	byte_count = pixel_count * (unsigned long)channels;
+	if (
+		pixel_count > QOI_PIXELS_MAX ||
+		byte_count > (unsigned long)0x7fffffff
+	) {
+		return NULL;
+	}
+	px_len = (size_t)byte_count;
+
 	pixels = (unsigned char *) QOI_MALLOC(px_len);
 	if (!pixels) {
 		return NULL;
@@ -536,8 +551,12 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	px.rgba.b = 0;
 	px.rgba.a = 255;
 
+	/* Bounds-check every multi-byte chunk against the remaining input
+	   before touching its payload. The 8-byte end marker is never read
+	   as chunk data, and a truncated stream returns an error instead of
+	   reading out of bounds or emitting filler pixels. */
 	chunks_len = size - (int)sizeof(qoi_padding);
-	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+	for (px_pos = 0; px_pos < px_len; px_pos += (size_t)channels) {
 		if (run > 0) {
 			run--;
 		}
@@ -545,11 +564,17 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			int b1 = bytes[p++];
 
 			if (b1 == QOI_OP_RGB) {
+				if (p + 3 > chunks_len) {
+					goto error;
+				}
 				px.rgba.r = bytes[p++];
 				px.rgba.g = bytes[p++];
 				px.rgba.b = bytes[p++];
 			}
 			else if (b1 == QOI_OP_RGBA) {
+				if (p + 4 > chunks_len) {
+					goto error;
+				}
 				px.rgba.r = bytes[p++];
 				px.rgba.g = bytes[p++];
 				px.rgba.b = bytes[p++];
@@ -564,8 +589,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.b += ( b1       & 0x03) - 2;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
-				int b2 = bytes[p++];
-				int vg = (b1 & 0x3f) - 32;
+				if (p + 1 > chunks_len) {
+					goto error;
+				}
+				b2 = bytes[p++];
+				vg = (b1 & 0x3f) - 32;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
 				px.rgba.b += vg - 8 +  (b2       & 0x0f);
@@ -575,6 +603,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			}
 
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
+		}
+		else {
+			/* More pixels were requested but no chunk data remains:
+			   the stream is truncated. */
+			goto error;
 		}
 
 		pixels[px_pos + 0] = px.rgba.r;
@@ -587,6 +620,10 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	return pixels;
+
+error:
+	QOI_FREE(pixels);
+	return NULL;
 }
 
 #ifndef QOI_NO_STDIO
