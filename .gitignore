@@ -3,3 +3,7 @@ stb_image.h
 stb_image_write.h
 qoibench
 qoiconv
+fuzz/gen_valid
+fuzz/harness
+fuzz/decode_one
+fuzz/diag_one
