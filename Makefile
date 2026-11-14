@@ -17,6 +17,11 @@ conv: $(TARGET_CONV)
 $(TARGET_CONV):$(TARGET_CONV).c qoi.h
 	$(CC) $(CFLAGS_CONV) $(CFLAGS) $(TARGET_CONV).c -o $(TARGET_CONV) $(LFLAGS_CONV)
 
+test: qoirowtest
+	./qoirowtest
+qoirowtest:qoirowtest.c qoi.h
+	$(CC) $(CFLAGS_CONV) $(CFLAGS) qoirowtest.c -o qoirowtest $(LFLAGS_CONV)
+
 .PHONY: clean
 clean:
-	$(RM) $(TARGET_BENCH) $(TARGET_CONV)
+	$(RM) $(TARGET_BENCH) $(TARGET_CONV) qoirowtest

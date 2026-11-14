@@ -46,6 +46,10 @@ This library provides the following functions;
 - qoi_write   -- encode and write a QOI file
 - qoi_encode  -- encode an rgba buffer into a QOI image in memory
 
+To decode one row of pixels at a time instead of a whole image at once, use
+- qoi_decode_init -- initialize a row-by-row decoder
+- qoi_decode_row  -- decode the next row of pixels
+
 See the function declaration below for the signature and more information.
 
 If you don't want/need the qoi_read and qoi_write functions, you can define
@@ -289,6 +293,63 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* Row-by-row decoder. Instead of decoding the whole image into one big
+buffer, a qoi_decoder decodes one row of pixels at a time into a caller
+supplied buffer. This keeps the peak memory footprint at roughly one row
+(width * channels bytes) plus the encoded data, instead of the whole image.
+
+The decoded pixels are identical to what qoi_decode() would produce.
+
+Usage:
+
+	qoi_decoder dec;
+	if (!qoi_decode_init(&dec, qoi_data, qoi_size, 4)) {
+		// invalid data
+	}
+	unsigned char *row = malloc(dec.desc.width * dec.channels);
+	while (qoi_decode_row(&dec, row)) {
+		// process one row of dec.desc.width pixels
+	}
+	free(row);
+
+All fields of qoi_decoder are considered private. Do not modify them. */
+
+typedef struct {
+	qoi_desc desc;             /* description from the file header */
+	int channels;              /* number of output channels, 3 or 4 */
+	unsigned int rows_decoded; /* number of rows decoded so far */
+	const unsigned char *data; /* the encoded qoi data */
+	int size;                  /* size of the encoded data in bytes */
+	int p;                     /* current read position in data */
+	int run;                   /* remaining run-length of the previous pixel */
+	unsigned int px;           /* current pixel value */
+	unsigned int index[64];    /* index of previously seen pixels */
+} qoi_decoder;
+
+
+/* Initialize a row-by-row decoder for a QOI image in memory. If channels is
+0, the number of channels from the file header is used. If channels is 3 or 4
+the output format will be forced into this number of channels.
+
+The data pointer must remain valid until the last row has been decoded; the
+decoder does not copy the encoded data.
+
+The function returns 0 on failure (invalid parameters) or non-zero on
+success. On success, dec->desc is filled with the description from the file
+header and dec->channels holds the number of output channels. */
+
+int qoi_decode_init(qoi_decoder *dec, const void *data, int size, int channels);
+
+
+/* Decode the next row of pixels into row_pixels. The row_pixels buffer must
+hold at least dec->desc.width * dec->channels bytes.
+
+The function returns non-zero when a row has been decoded, or 0 when all
+rows (dec->desc.height in total) have been decoded. */
+
+int qoi_decode_row(qoi_decoder *dec, void *row_pixels);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -485,78 +546,105 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	return bytes;
 }
 
-void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
+int qoi_decode_init(qoi_decoder *dec, const void *data, int size, int channels) {
 	const unsigned char *bytes;
 	unsigned int header_magic;
-	unsigned char *pixels;
-	qoi_rgba_t index[64];
 	qoi_rgba_t px;
-	int px_len, chunks_len, px_pos;
-	int p = 0, run = 0;
+	int p = 0;
 
 	if (
-		data == NULL || desc == NULL ||
+		dec == NULL || data == NULL ||
 		(channels != 0 && channels != 3 && channels != 4) ||
 		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
 	) {
-		return NULL;
+		return 0;
 	}
 
 	bytes = (const unsigned char *)data;
 
 	header_magic = qoi_read_32(bytes, &p);
-	desc->width = qoi_read_32(bytes, &p);
-	desc->height = qoi_read_32(bytes, &p);
-	desc->channels = bytes[p++];
-	desc->colorspace = bytes[p++];
+	dec->desc.width = qoi_read_32(bytes, &p);
+	dec->desc.height = qoi_read_32(bytes, &p);
+	dec->desc.channels = bytes[p++];
+	dec->desc.colorspace = bytes[p++];
 
 	if (
-		desc->width == 0 || desc->height == 0 ||
-		desc->channels < 3 || desc->channels > 4 ||
-		desc->colorspace > 1 ||
+		dec->desc.width == 0 || dec->desc.height == 0 ||
+		dec->desc.channels < 3 || dec->desc.channels > 4 ||
+		dec->desc.colorspace > 1 ||
 		header_magic != QOI_MAGIC ||
-		desc->height >= QOI_PIXELS_MAX / desc->width
+		dec->desc.height >= QOI_PIXELS_MAX / dec->desc.width
 	) {
-		return NULL;
+		return 0;
 	}
 
 	if (channels == 0) {
-		channels = desc->channels;
+		channels = dec->desc.channels;
 	}
 
-	px_len = desc->width * desc->height * channels;
-	pixels = (unsigned char *) QOI_MALLOC(px_len);
-	if (!pixels) {
-		return NULL;
-	}
+	dec->data = bytes;
+	dec->size = size;
+	dec->channels = channels;
+	dec->rows_decoded = 0;
+	dec->p = p;
+	dec->run = 0;
 
-	QOI_ZEROARR(index);
+	/* The pixel index and the "previous pixel" start out zeroed, with the
+	alpha of the previous pixel set to 255. */
+	QOI_ZEROARR(dec->index);
 	px.rgba.r = 0;
 	px.rgba.g = 0;
 	px.rgba.b = 0;
 	px.rgba.a = 255;
+	dec->px = px.v;
 
-	chunks_len = size - (int)sizeof(qoi_padding);
-	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+	return 1;
+}
+
+int qoi_decode_row(qoi_decoder *dec, void *row_pixels) {
+	unsigned char *pixels;
+	qoi_rgba_t px;
+	qoi_rgba_t index[64];
+	int chunks_len, run, p;
+	unsigned int x, width;
+	int channels;
+
+	if (
+		dec == NULL || row_pixels == NULL ||
+		dec->rows_decoded >= dec->desc.height
+	) {
+		return 0;
+	}
+
+	pixels = (unsigned char *)row_pixels;
+	width = dec->desc.width;
+	channels = dec->channels;
+	p = dec->p;
+	run = dec->run;
+	px.v = dec->px;
+	memcpy(index, dec->index, sizeof(index));
+	chunks_len = dec->size - (int)sizeof(qoi_padding);
+
+	for (x = 0; x < width; x++) {
 		if (run > 0) {
 			run--;
 		}
 		else if (p < chunks_len) {
-			int b1 = bytes[p++];
+			int b1 = dec->data[p++];
 
 			if (b1 == QOI_OP_RGB) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
+				px.rgba.r = dec->data[p++];
+				px.rgba.g = dec->data[p++];
+				px.rgba.b = dec->data[p++];
 			}
 			else if (b1 == QOI_OP_RGBA) {
-				px.rgba.r = bytes[p++];
-				px.rgba.g = bytes[p++];
-				px.rgba.b = bytes[p++];
-				px.rgba.a = bytes[p++];
+				px.rgba.r = dec->data[p++];
+				px.rgba.g = dec->data[p++];
+				px.rgba.b = dec->data[p++];
+				px.rgba.a = dec->data[p++];
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
-				px = index[b1];
+				px.v = index[b1].v;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
 				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
@@ -564,7 +652,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 				px.rgba.b += ( b1       & 0x03) - 2;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
-				int b2 = bytes[p++];
+				int b2 = dec->data[p++];
 				int vg = (b1 & 0x3f) - 32;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
@@ -577,15 +665,46 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
 		}
 
-		pixels[px_pos + 0] = px.rgba.r;
-		pixels[px_pos + 1] = px.rgba.g;
-		pixels[px_pos + 2] = px.rgba.b;
-		
+		*pixels++ = px.rgba.r;
+		*pixels++ = px.rgba.g;
+		*pixels++ = px.rgba.b;
+
 		if (channels == 4) {
-			pixels[px_pos + 3] = px.rgba.a;
+			*pixels++ = px.rgba.a;
 		}
 	}
 
+	dec->p = p;
+	dec->run = run;
+	dec->px = px.v;
+	memcpy(dec->index, index, sizeof(index));
+	dec->rows_decoded++;
+	return 1;
+}
+
+void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
+	qoi_decoder dec;
+	unsigned char *pixels;
+	unsigned int y;
+
+	if (desc == NULL || !qoi_decode_init(&dec, data, size, channels)) {
+		return NULL;
+	}
+
+	pixels = (unsigned char *) QOI_MALLOC(
+		dec.desc.width * dec.desc.height * dec.channels
+	);
+	if (!pixels) {
+		return NULL;
+	}
+
+	for (y = 0; y < dec.desc.height; y++) {
+		qoi_decode_row(
+			&dec, pixels + (size_t)y * dec.desc.width * dec.channels
+		);
+	}
+
+	*desc = dec.desc;
 	return pixels;
 }
 
